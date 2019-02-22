@@ -43,38 +43,6 @@ from lazyflow.stype import ArrayLike
 from lazyflow.metaDict import MetaDict
 from lazyflow.utility import slicingtools, OrderedSignal
 
-
-
-
-
-import code, traceback, signal
-
-def debug(sig, frame):
-    """Interrupt running process, and provide a python prompt for
-    interactive debugging."""
-    d={'_frame':frame}         # Allow access to frame object.
-    d.update(frame.f_globals)  # Unless shadowed by global
-    d.update(frame.f_locals)
-
-    i = code.InteractiveConsole(d)
-    message  = "Signal received : entering python shell.\nTraceback:\n"
-    message += ''.join(traceback.format_stack(frame))
-    i.interact(message)
-
-def listen():
-    signal.signal(signal.SIGUSR1, debug)  # Register handler
-
-listen()
-
-
-
-
-
-
-
-
-
-
 class ValueRequest(object):
     """Pseudo request that behaves like a request.Request object.
 
@@ -160,7 +128,6 @@ class Slot(object):
 
     class SlotNotReadyError(Exception):
         def __init__(self, slot):
-            import pydevd; pydevd.settrace()
             import textwrap
             indent_prefix = '  '
             op = slot.getRealOperator()
@@ -594,8 +561,6 @@ class Slot(object):
         """
         Disconnect a InputSlot from its upstream_slot
         """
-        import traceback;
-        self.last_disconnect_stack = ''.join(traceback.format_stack())
         if self.backpropagate_values and self.getRealOperator() and not self.getRealOperator()._cleaningUp:
             if self.upstream_slot is not None:
                 self.upstream_slot.disconnect()
