@@ -439,6 +439,29 @@ class Operator(metaclass=OperatorMetaClass):
         wrapper.__wrapped__ = func # Emulate python 3 behavior of @wraps
         return wrapper
 
+    def acquire_setup_lock(self):
+        self._condition.acquire()
+            while self._settingUp or not self.configured():
+                self._condition.wait()
+
+    def release_setup_lock(self):
+        self._condition.notifyAll()
+        self._condition.release()
+
+    def _increment_execution_count(self):
+        assert self._executionCount >= 0, "BUG: How did the execution count get negative?"
+        # We can't execute while the operator is in the middle of setupOutputs
+        with self._condition:
+            while self._settingUp:
+                self._condition.wait()
+            self._executionCount += 1
+
+    def _decrement_execution_count(self):
+        assert self._executionCount > 0, "BUG: Can't decrement the execution count below zero!"
+        with self._condition:
+            self._executionCount -= 1
+            self._condition.notifyAll()
+
     def _setupOutputs(self):
         # Don't setup this operator if there are currently
         # requests on it.
@@ -458,35 +481,36 @@ class Operator(metaclass=OperatorMetaClass):
             self._settingUp = False
             self._condition.notifyAll()
 
-        try:
-            # Determine new "ready" flags
-            for k, oslot in list(self.outputs.items()):
-                if oslot.upstream_slot is None:
-                    # Special case, operators can flag an output as not actually being ready yet,
-                    #  in which case we do NOT notify downstream connections.
-                    if oslot.meta.NOTREADY:
-                        oslot.disconnect() # Forces unready state
+            try:
+                # Determine new "ready" flags
+                for oslot in self.outputs.values():
+                    if oslot.upstream_slot is None:
+                        # Special case, operators can flag an output as not actually being ready yet,
+                        #  in which case we do NOT notify downstream connections.
+                        if oslot.meta.NOTREADY:
+                            oslot.disconnect() # Forces unready state
+                        else:
+                            # All unconnected outputs are ready after
+                            # setupOutputs
+                            oslot._setReady()
                     else:
-                        # All unconnected outputs are ready after
-                        # setupOutputs
-                        oslot._setReady()
-                else:
-                    assert oslot.meta.NOTREADY is None, \
-                        "The special NOTREADY setting can only be used for output " \
-                        "slots that have no explicit upstream connection."
+                        assert oslot.meta.NOTREADY is None, \
+                            "The special NOTREADY setting can only be used for output " \
+                            "slots that have no explicit upstream connection."
 
-            #notify outputs of probably changed meta information
-            for oslot in list(self.outputs.values()):
-                if ( old_metadata[oslot] != oslot.meta and  # No need to call _changed() if nothing changed...
-                    not (not old_metadata[oslot]._ready and oslot.meta._ready)): # No need to call _changed() if it was already called in _setReady() above.
+                    #notify outputs of probably changed meta information
+                    if old_metadata[oslot] == oslot.meta:
+                        continue # No need to call _changed() if nothing changed...
+                    if not old_metadata[oslot]._ready and oslot.meta._ready:
+                        continue# No need to call _changed() if it was already called in _setReady() above.
                     oslot._changed()
-        except:
-            # Something went wrong
-            # Make the operator-supplied outputs unready again
-            for k, oslot in list(self.outputs.items()):
-                if oslot.upstream_slot is None:
-                    oslot.disconnect() # Forces unready state
-            raise
+            except:
+                # Something went wrong
+                # Make the operator-supplied outputs unready again
+                for oslot in self.outputs.values():
+                    if oslot.upstream_slot is None:
+                        oslot.disconnect() # Forces unready state
+                raise
 
     def handleInputBecameUnready(self, slot):
         # One of our input slots was disconnected.

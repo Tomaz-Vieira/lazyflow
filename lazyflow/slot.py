@@ -43,6 +43,38 @@ from lazyflow.stype import ArrayLike
 from lazyflow.metaDict import MetaDict
 from lazyflow.utility import slicingtools, OrderedSignal
 
+
+
+
+
+import code, traceback, signal
+
+def debug(sig, frame):
+    """Interrupt running process, and provide a python prompt for
+    interactive debugging."""
+    d={'_frame':frame}         # Allow access to frame object.
+    d.update(frame.f_globals)  # Unless shadowed by global
+    d.update(frame.f_locals)
+
+    i = code.InteractiveConsole(d)
+    message  = "Signal received : entering python shell.\nTraceback:\n"
+    message += ''.join(traceback.format_stack(frame))
+    i.interact(message)
+
+def listen():
+    signal.signal(signal.SIGUSR1, debug)  # Register handler
+
+listen()
+
+
+
+
+
+
+
+
+
+
 class ValueRequest(object):
     """Pseudo request that behaves like a request.Request object.
 
@@ -128,6 +160,7 @@ class Slot(object):
 
     class SlotNotReadyError(Exception):
         def __init__(self, slot):
+            import pydevd; pydevd.settrace()
             import textwrap
             indent_prefix = '  '
             op = slot.getRealOperator()
@@ -181,6 +214,8 @@ class Slot(object):
           being considered lane-indexed
 
         """
+        self.last_disconnect_stack = None
+
         # This assertion is here for a reason: default values do NOT work on OutputSlots.
         # (We should probably change that at some point...)
         assert value is None or isinstance(self, InputSlot), "Only InputSlots can have default values.  OutputSlots cannot."
@@ -246,10 +281,6 @@ class Slot(object):
         self._sig_inserted = OrderedSignal(hide_cancellation_exceptions=True)
 
         self._resizing = False
-
-        self._executionCount = 0
-        self._settingUp = False
-        self._condition = threading.Condition()
 
         # Allow slots to be sorted by their order of creation for
         # debug output and diagramming purposes.
@@ -563,6 +594,8 @@ class Slot(object):
         """
         Disconnect a InputSlot from its upstream_slot
         """
+        import traceback;
+        self.last_disconnect_stack = ''.join(traceback.format_stack())
         if self.backpropagate_values and self.getRealOperator() and not self.getRealOperator()._cleaningUp:
             if self.upstream_slot is not None:
                 self.upstream_slot.disconnect()
@@ -745,48 +778,26 @@ class Slot(object):
             # --> construct cheaper request object for this case
             result = self.stype.writeIntoDestination(None, self._value, roi)
             return ValueRequest(result)
-        elif self.upstream_slot is not None:
-            # this handles the case of an inputslot
+
+        if self.upstream_slot is not None:
             # --> just relay the request
             return self.upstream_slot.get(roi)
-        else:
-            if not self.ready():
-                # Something is wrong.  Are we cancelled?
-                Request.raise_if_cancelled()
 
-                msg = "Can't get data from slot {}.{} yet."\
-                      " It isn't ready."\
-                      "First upstream problem slot is: {}"
-                problem_slot = Slot._findUpstreamProblemSlot(self)
-                problem_str = str( problem_slot )
-                if isinstance( problem_slot, Slot ):
-                    problem_op = problem_slot.getRealOperator()
-                    problem_str = problem_op.name + '/' + str( problem_slot )
-                msg = msg.format( self.getRealOperator() and self.getRealOperator().__class__, self.name, problem_str )
-                raise Slot.SlotNotReadyError(msg)
+        # normal (outputslot) case
+        # --> construct heavy request object..
+        execWrapper = Slot.RequestExecutionWrapper(self, roi)
+        request = Request(execWrapper)
 
-            # If someone is asking for data from an inputslot that has
-            #  no value and no upstream_slot, then something is wrong.
-            if self._type == "input":
-                # Something is wrong.  Are we cancelled?
-                Request.raise_if_cancelled()
-                assert self._type != "input", "This inputSlot has no value and no upstream_slot.  You can't ask for its data yet!"
-            # normal (outputslot) case
-            # --> construct heavy request object..
-            execWrapper = Slot.RequestExecutionWrapper(self, roi)
-            request = Request(execWrapper)
+        # We must decrement the execution count even if the
+        # request is cancelled
+        request.notify_cancelled(execWrapper.handleCancel)
+        return request
 
-            # We must decrement the execution count even if the
-            # request is cancelled
-            request.notify_cancelled(execWrapper.handleCancel)
-            return request
-
-    @staticmethod
-    def _findUpstreamProblemSlot(slot):
-        if slot.upstream_slot is not None:
-            return Slot._findUpstreamProblemSlot(slot.upstream_slot)
-        if slot.getRealOperator() is not None:
-            for inputSlot in list(slot.getRealOperator().inputs.values()):
+    def _findUpstreamProblemSlot(self):
+        if self.upstream_slot is not None:
+            return self._findUpstreamProblemSlot(self.upstream_slot)
+        if self.getRealOperator() is not None:
+            for inputSlot in list(self.getRealOperator().inputs.values()):
                 if not inputSlot._optional and not inputSlot.ready():
                     return inputSlot
         return "Couldn't find an upstream problem slot."
@@ -821,6 +832,11 @@ class Slot(object):
             try:
                 # Execute the workload, which might not ever return
                 # (if we get cancelled).
+                print(f"Slot {self.slot} is requesting the graph lock...")
+                self.slot.getRealOperator().acquire_setup_lock()
+                if not self.ready():
+                    raise Slot.SlotNotReadyError(self)
+
                 result_op = self.operator.execute(self.slot, (), self.roi, destination)
 
                 # copy data from result_op to destination, if
@@ -848,25 +864,15 @@ class Slot(object):
                     # check that the returned value is compatible with the requested roi
                     self.slot.stype.check_result_valid(self.roi, destination)
 
-
-                # Decrement the execution count
-                self._decrementOperatorExecutionCount()
                 return destination
-            except: # except Request.CancellationException
-                # Decrement the execution count
+            finally:
                 self._decrementOperatorExecutionCount()
-                raise
+                print(f"Slot {self.slot} is releasing setup lock for op ")
+                self.getRealOperator().release_setup_lock()
 
         def _incrementOperatorExecutionCount(self):
             self.started = True
-            assert self.operator._executionCount >= 0, \
-                          "BUG: How did the execution count get negative?"
-            # We can't execute while the operator is in the middle of
-            # setupOutputs
-            with self.operator._condition:
-                while self.operator._settingUp:
-                    self.operator._condition.wait()
-                self.operator._executionCount += 1
+            self.slot.getRealOperator()._increment_execution_count()
 
         def handleCancel(self, *args):
             # The new request api does clean up by handling an
@@ -884,12 +890,8 @@ class Slot(object):
                 # Only do this once per execution. If we were cancelled
                 # after we finished working, don't do anything
                 if self.started and not self.finished:
-                    assert self.operator._executionCount > 0, \
-                          "BUG: Can't decrement the execution count below zero!"
                     self.finished = True
-                    with self.operator._condition:
-                        self.operator._executionCount -= 1
-                        self.operator._condition.notifyAll()
+                    self.slot.getRealOperator()._decrement_execution_count()
 
     @is_setup_fn    
     def setDirty(self, *args, **kwargs):
@@ -940,34 +942,8 @@ class Slot(object):
                 else:
                     return self._subSlots[key[0]][key[1:]]
             return self._subSlots[key]
-        else:
-            if self.meta.shape is None:
-                # Something is wrong.  Are we cancelled?
-                Request.raise_if_cancelled()
-                if not self.ready():
-                    #msg = "This slot ({}.{}) isn't ready yet, which means " \
-                    #      "you can't ask for its data.  Is it connected?".format(self.getRealOperator() and self.getRealOperator().name, self.name)
-                    #self.logger.error(msg)
-                    problem_slot = Slot._findUpstreamProblemSlot(self)
-                    problem_str = str( problem_slot )
-                    if isinstance( problem_slot, Slot ):
-                        problem_op = problem_slot.getRealOperator()
-                        if problem_op is not None:
-                            problem_str = problem_op.name + '/' + str( problem_slot )
-                        else:
-                            problem_str = '<NO OPERATOR> /' + str( problem_slot )                            
-                    slotInfoMsg = "Can't get data from slot {}.{} yet."\
-                                  " It isn't ready."\
-                                  "First upstream problem slot is: {}"\
-                                  "".format( self.getRealOperator() and self.getRealOperator().__class__, self.name, problem_str )
-                    #self.logger.error(slotInfoMsg)
-                    raise Slot.SlotNotReadyError(slotInfoMsg)
-                assert self.meta.shape is not None, \
-                    ("Can't ask for slices of this slot yet:"
-                     " self.meta.shape is None!"
-                     " (operator {} [self={}] slot: {}, key={}".format(
-                         self.operator.name, self.operator, self.name, key))
-            return self(pslice=key)
+
+        return self(pslice=key)
 
 
     def __setitem__(self, key, value):
@@ -1349,14 +1325,8 @@ class Slot(object):
             self._sig_changed(self)
 
     def _configureOperator(self, slot, oldSize=0, newSize=0, notify=True):
-        """Call setupOutputs of Operator if all slots of the operator
-        are connected and configured.
-
-        """
-        if self.operator is not None:
-            # check whether all slots are connected and notify operator
-            if self.operator.configured():
-                self.operator._setupOutputs()
+        if self.operator is not None and self.operator.configured():
+            self.operator._setupOutputs()
 
     def _setupOutputs(self):
         """
@@ -1462,11 +1432,6 @@ class InputSlot(Slot):
         # configure operator in case of slot change
         self.notifyResized(self._configureOperator)
 
-    def _get(self, roi):
-        # --> construct cheaper request object for this case
-        result = self.stype.writeIntoDestination(None, self._value, roi)
-        return ValueRequest(result)
-
     def is_close_to(self, other_slot):
         my_op = self.getRealOperator()
         producer_op = other_slot.getRealOperator()
@@ -1496,15 +1461,6 @@ class OutputSlot(Slot):
         super(OutputSlot, self).__init__(*args, **kwargs)
         self._type = "output"
         assert 'optional' not in kwargs, '"optional" init arg cannot be used with OutputSlot'
-
-    def _get(self, roi):
-        execWrapper = Slot.RequestExecutionWrapper(self, roi)
-        request = Request(execWrapper)
-
-        # We must decrement the execution count even if the
-        # request is cancelled
-        request.notify_cancelled(execWrapper.handleCancel)
-        return request
 
     def connect(self, upstream_slot, notify=True, permit_distant_connection=False):
         super().connect(upstream_slot=upstream_slot, notify=notify,
