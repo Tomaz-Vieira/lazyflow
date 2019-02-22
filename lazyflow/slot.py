@@ -1,11 +1,5 @@
-from builtins import next
-
-from builtins import range
-from builtins import object
 from future.utils import raise_with_traceback
 import sys
-if sys.version_info.major >= 3:
-    unicode = str
 
 ###############################################################################
 #   lazyflow: data flow based lazy parallel computation framework
@@ -196,14 +190,10 @@ class Slot(object):
             "The operator, \"%s\", is being setup to receive a masked array as input to slot, \"%s\"." \
             " This is currently not supported." \
             % (self.operator.name, self.name)
-        
-        # Check for simple mistakes in parameter order...
-        assert isinstance(name, (str, unicode))
-        assert isinstance(optional, bool)
-        
+
         if not hasattr(self, "_type"):
             self._type = None
-        if isinstance(stype, (str, unicode)):
+        if isinstance(stype, str):
             stype = ArrayLike
         self.downstream_slots = []
         self.name = name
